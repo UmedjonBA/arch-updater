@@ -1,12 +1,12 @@
 id = "umedbazarov/arch-updater"
 name = "Arch Updater"
-version = "2.3.1"
+version = "2.5.0"
 plugin_api = 9
 author = "umedbazarov"
 license = "MIT"
 icon = "package"
-description = "Check pacman, AUR and Flatpak updates, then upgrade in the background with a live log and one polkit password prompt."
-dependencies = ["pacman-contrib", "awk", "flatpak", "pacman", "paru", "pkexec", "sed", "sh", "sudo", "tail", "test", "uname", "xdg-open", "yay"]
+description = "Check pacman, AUR and Flatpak updates, then upgrade in a terminal or in the background, with history, rollback and cache/orphan maintenance."
+dependencies = ["pacman-contrib", "awk", "cat", "cut", "date", "df", "du", "flatpak", "grep", "head", "install", "kill", "less", "pacman", "paru", "pkexec", "rm", "sed", "sh", "sudo", "systemd-inhibit", "tail", "tee", "test", "uname", "wc", "xdg-open", "yay"]
 tags = ["arch", "bar", "panel", "launcher", "system", "utility"]
 
 # ── General ──────────────────────────────────────────────────────────────────
@@ -86,7 +86,84 @@ label_key = "settings.check_reboot_needed.label"
 description_key = "settings.check_reboot_needed.description"
 default = true
 
+[[setting]]
+key = "show_activity_graph"
+type = "bool"
+label_key = "settings.show_activity_graph.label"
+description_key = "settings.show_activity_graph.description"
+default = false
+
+[[setting]]
+key = "activity_history_length"
+type = "int"
+label_key = "settings.activity_history_length.label"
+description_key = "settings.activity_history_length.description"
+default = 10
+min = 3
+max = 30
+visible_when = { key = "show_activity_graph", values = ["true"] }
+
 # ── Update run ───────────────────────────────────────────────────────────────
+
+[[setting]]
+key = "update_mode"
+type = "select"
+label_key = "settings.update_mode.label"
+description_key = "settings.update_mode.description"
+default = "terminal"
+options = [
+  { value = "terminal", label_key = "settings.update_mode.options.terminal" },
+  { value = "background", label_key = "settings.update_mode.options.background" },
+]
+
+[[setting]]
+key = "show_changelog_after_update"
+type = "bool"
+label_key = "settings.show_changelog_after_update.label"
+description_key = "settings.show_changelog_after_update.description"
+default = true
+
+[[setting]]
+key = "keyring_first"
+type = "bool"
+label_key = "settings.keyring_first.label"
+description_key = "settings.keyring_first.description"
+default = true
+
+[[setting]]
+key = "inhibit_sleep"
+type = "bool"
+label_key = "settings.inhibit_sleep.label"
+description_key = "settings.inhibit_sleep.description"
+default = true
+
+[[setting]]
+key = "min_free_mib"
+type = "int"
+label_key = "settings.min_free_mib.label"
+description_key = "settings.min_free_mib.description"
+default = 1024
+min = 0
+max = 16384
+
+# ── Maintenance ──────────────────────────────────────────────────────────────
+
+[[setting]]
+key = "maintenance_enabled"
+type = "bool"
+label_key = "settings.maintenance_enabled.label"
+description_key = "settings.maintenance_enabled.description"
+default = true
+
+[[setting]]
+key = "cache_keep"
+type = "int"
+label_key = "settings.cache_keep.label"
+description_key = "settings.cache_keep.description"
+default = 2
+min = 1
+max = 5
+visible_when = { key = "maintenance_enabled", values = ["true"] }
 
 [[setting]]
 key = "rollback_auto_ignore"

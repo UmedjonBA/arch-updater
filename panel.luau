@@ -4,11 +4,11 @@
 -- actions this panel emits, so closing the panel never interrupts a check or
 -- a run in progress.
 --
--- One click on "Update" starts the background run: pkexec raises the polkit
--- password dialog, everything else is non-interactive. While it runs, the
--- package list gives way to a live tail of the update log plus a progress
--- bar. A failed run keeps its log on screen and offers a terminal fallback
--- where prompts work normally.
+-- "Update" follows the update_mode setting: a terminal window (default,
+-- like the original plugin) or a non-interactive background run. Either
+-- way the package list gives way to a live tail of the update log plus a
+-- progress bar while it runs. A failed background run keeps its log on
+-- screen and offers a terminal retry where prompts work normally.
 
 local STATE_KEY = "arch_state"
 local REQUEST_KEY = "arch_request"
@@ -20,12 +20,50 @@ local hoverText = "" -- what the detail line shows
 local listOpen = false -- at least one source is expanded this render
 local openedRunAt = nil -- history run whose package list replaces the sources
 local armedKey = nil -- rollback button waiting for its confirming second click
+local armedAt = 0 -- when it was armed; the confirm auto-disarms after a while
+local ARM_TIMEOUT_S = 8
+local activityHoverIndex = nil -- activity graph point currently under the pointer
+local changelogOpen = false -- changelog view replaces the sources
+local changelogAutoOpenPending = false -- set with changelogOpen when a just-finished update opened it, so onOpen() doesn't reset it away unseen
 
 local render
 
 local function tr(key, args)
     return noctalia.tr(key, args)
 end
+
+-- CHANGELOG.md, parsed once at load: "## version — date" headers, "- " bullet
+-- lines under each. readFile resolves relative to the plugin directory.
+local function parseChangelog(text)
+    local releases = {}
+    local current = nil
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+        local version, date = line:match("^##%s+(%S+)%s*(.-)%s*$")
+        if version ~= nil then
+            -- Strip the "— " (or "- ") separator before the date. Done as a
+            -- literal gsub rather than folded into the match pattern above,
+            -- since Lua patterns treat a multi-byte UTF-8 dash inside a
+            -- character class as a set of individual bytes, not one glyph.
+            date = date:gsub("^—%s*", ""):gsub("^%-%s*", "")
+            current = { version = version, date = date, lines = {} }
+            table.insert(releases, current)
+        elseif current ~= nil then
+            local bullet = line:match("^%-%s+(.*)$")
+            if bullet ~= nil then
+                table.insert(current.lines, bullet)
+            end
+        end
+    end
+    return releases
+end
+
+local changelog = (function()
+    local text = noctalia.readFile("CHANGELOG.md")
+    if type(text) ~= "string" then
+        return {}
+    end
+    return parseChangelog(text)
+end)()
 
 -- extra: a package name string, or a table merged into the request payload
 -- (pkg/version/at for the rollback family).
@@ -123,6 +161,9 @@ local function headline()
         if snapshot ~= nil and snapshot.runKind == "rollback" then
             return tr("status_rolling_back"), "secondary"
         end
+        if snapshot ~= nil and snapshot.runMode == "terminal" then
+            return tr("status_running_terminal"), "secondary"
+        end
         return tr("status_running"), "secondary"
     elseif phase == "clean" then
         return tr("status_clean"), "on_surface"
@@ -186,7 +227,28 @@ local function cleanSources()
         table.insert(candidates, { key = "aur", entry = snapshot.aur })
     end
     for _, candidate in ipairs(candidates) do
-        if type(candidate.entry) == "table" and (candidate.entry.n or 0) == 0 then
+        -- A failed slot also has n == 0, but "up to date" is exactly what it
+        -- doesn't know — those go to failedSources() instead.
+        if type(candidate.entry) == "table" and (candidate.entry.n or 0) == 0 and candidate.entry.failed ~= true then
+            table.insert(names, sourceLabel(candidate.key, candidate.entry))
+        end
+    end
+    return names
+end
+
+-- Sources whose check could not complete this round (AUR unreachable,
+-- Flatpak remote down): the rest of the check went on without them.
+local function failedSources()
+    if snapshot == nil then
+        return {}
+    end
+    local names = {}
+    local candidates = {
+        { key = "aur", entry = snapshot.aur },
+        { key = "flatpak", entry = snapshot.flatpak },
+    }
+    for _, candidate in ipairs(candidates) do
+        if type(candidate.entry) == "table" and candidate.entry.failed == true then
             table.insert(names, sourceLabel(candidate.key, candidate.entry))
         end
     end
@@ -401,6 +463,186 @@ local function ignoredRows()
     return rows
 end
 
+-- ── Activity graph (the upstream feature, opt-in) ───────────────────────────
+
+-- Normalizes the pending-count history to 0..1 for ui.graph, relative to the
+-- min/max in the window (not a fixed scale, since pending counts vary wildly
+-- between systems). A flat window (min == max, e.g. every check so far found
+-- the same count) centers the line at 0.5 instead of pinning it to the top
+-- edge, where it would be indistinguishable from the box border.
+local function activityValues(history)
+    local minN, maxN = tonumber(history[1].n) or 0, tonumber(history[1].n) or 0
+    for _, entry in ipairs(history) do
+        local n = tonumber(entry.n) or 0
+        if n < minN then
+            minN = n
+        end
+        if n > maxN then
+            maxN = n
+        end
+    end
+    local range = maxN - minN
+    local values = {}
+    for _, entry in ipairs(history) do
+        local n = tonumber(entry.n) or 0
+        table.insert(values, range > 0 and (n - minN) / range or 0.5)
+    end
+    return values
+end
+
+local ACTIVITY_GRAPH_SUBDIVISIONS = 8
+
+local function upsampleLinear(values, subdivisions)
+    if #values < 2 or subdivisions <= 1 then
+        return values
+    end
+    local out = {}
+    for i = 1, #values - 1 do
+        local a, b = values[i], values[i + 1]
+        for s = 0, subdivisions - 1 do
+            table.insert(out, a + (b - a) * (s / subdivisions))
+        end
+    end
+    table.insert(out, values[#values])
+    return out
+end
+
+local function padGraphLookbehind(values)
+    if #values == 0 then
+        return values
+    end
+    local out = { values[1], values[1] }
+    for _, v in ipairs(values) do
+        table.insert(out, v)
+    end
+    return out
+end
+
+-- "2 hours ago", "3 days ago", etc. nil for entries migrated from the old
+-- history format, which never recorded a timestamp.
+local function relativeTime(at)
+    local t = tonumber(at)
+    if t == nil then
+        return nil
+    end
+    local diff = os.time() - t
+    if diff < 60 then
+        return tr("activity.just_now")
+    elseif diff < 3600 then
+        local m = math.floor(diff / 60)
+        return noctalia.trp("activity.minutes_ago", m, { count = m })
+    elseif diff < 86400 then
+        local h = math.floor(diff / 3600)
+        return noctalia.trp("activity.hours_ago", h, { count = h })
+    else
+        local d = math.floor(diff / 86400)
+        return noctalia.trp("activity.days_ago", d, { count = d })
+    end
+end
+
+-- "Updated · 2 hours ago" for the check that verified an update run, else
+-- "3 pending updates · 2 hours ago". Shared by the hover tooltip and the
+-- top-right caption so both describe a point the same way.
+local function describeEntry(entry)
+    local n = tonumber(entry.n) or 0
+    local text = entry.afterUpdate == true and tr("activity.updated")
+        or noctalia.trp("activity.pending_at", n, { count = n })
+    local when = relativeTime(entry.at)
+    if when ~= nil then
+        text = text .. " · " .. when
+    end
+    return text
+end
+
+-- ui.graph takes no pointer props of its own and the framework has no
+-- overlay control, so per-point hover cannot live on the line itself: it is
+-- a row of hit targets right under it, drawn as an axis of small dots (the
+-- hovered one lights up in the accent color) so the interactivity is
+-- visible without the ghost-button hover flash.
+--
+-- Real points sit at (k-1)/(#history-1) of the width (see
+-- padGraphLookbehind), i.e. #history-1 equal gaps, not #history equal slots
+-- - so this builds one equal-width segment per gap rather than per entry,
+-- ending each segment (and its dot) exactly on the point at its right edge.
+-- That leaves entry 1 (at the left edge, with no gap before it) without its
+-- own hover zone, but keeps every other spike landing right at the end of
+-- its segment instead of drifting toward the start of an oversized one.
+local function activityHoverRow(history)
+    local segments = {}
+    for i = 2, #history do
+        local hovered = activityHoverIndex == i
+        segments[i - 1] = ui.row({
+            key = "activity-hit-" .. i .. (hovered and "-on" or ""),
+            flexGrow = 1,
+            height = 12,
+            align = "center",
+            justify = "end",
+            onHover = function(state)
+                if state == "true" then
+                    activityHoverIndex = i
+                elseif activityHoverIndex == i then
+                    activityHoverIndex = nil
+                else
+                    return
+                end
+                render()
+            end,
+        }, {
+            ui.box({
+                width = hovered and 7 or 5,
+                height = hovered and 7 or 5,
+                radius = 4,
+                fill = hovered and "primary" or "outline/0.6",
+            }),
+        })
+    end
+    return ui.row({ key = "activity-hits", gap = 1 }, segments)
+end
+
+-- A small trend graph of pending-update counts across recent checks, plus
+-- when the last update ran (or, while hovering a point, that point's own
+-- description). Off entirely when show_activity_graph is off, and hidden
+-- until there is enough history to draw a line.
+local function activitySection()
+    if snapshot == nil or noctalia.getConfig("show_activity_graph") ~= true then
+        return nil
+    end
+    local history = type(snapshot.activity) == "table" and snapshot.activity or {}
+    if #history < 2 then
+        return nil
+    end
+
+    local hoveredEntry = activityHoverIndex ~= nil and history[activityHoverIndex] or nil
+    local caption
+    if hoveredEntry ~= nil then
+        caption = describeEntry(hoveredEntry)
+    else
+        local lastUpdateAt = tonumber(snapshot.lastUpdateAt)
+        if lastUpdateAt == nil then
+            caption = tr("activity.never_updated")
+        else
+            local days = math.floor((os.time() - lastUpdateAt) / 86400)
+            caption = days <= 0 and tr("activity.updated_today")
+                or noctalia.trp("activity.updated_days_ago", days, { count = days })
+        end
+    end
+
+    return ui.column({ key = "activity", gap = 4 }, {
+        ui.row({ justify = "space_between", align = "center" }, {
+            ui.label({ text = tr("activity.title"), fontSize = 11, fontWeight = "bold", color = "on_surface_variant" }),
+            ui.label({ text = caption, fontSize = 10, color = "on_surface_variant" }),
+        }),
+        ui.graph({
+            values = padGraphLookbehind(upsampleLinear(activityValues(history), ACTIVITY_GRAPH_SUBDIVISIONS)),
+            color = "primary",
+            fillOpacity = 0.15,
+            lineWidth = 2,
+            height = 36,
+        }),
+        activityHoverRow(history),
+    })
+end
+
 -- ── Run history and rollback ─────────────────────────────────────────────────
 
 local function historyRuns()
@@ -480,7 +722,7 @@ end
 -- Two-click rollback: the first click arms the button (it turns into a
 -- confirm label), the second sends the request. Anything else re-renders
 -- the armed state away.
-local function rollbackButton(key, tooltip, onConfirm)
+local function rollbackButton(key, tooltip, onConfirm, glyph)
     if armedKey == key then
         return ui.button({
             key = key .. "-armed",
@@ -494,10 +736,11 @@ local function rollbackButton(key, tooltip, onConfirm)
     end
     return ui.button({
         key = key,
-        glyph = "undo", variant = "ghost", controlSize = "sm", width = 22, height = 22, glyphSize = 12,
+        glyph = glyph or "undo", variant = "ghost", controlSize = "sm", width = 22, height = 22, glyphSize = 12,
         tooltip = tooltip,
         onClick = function()
             armedKey = key
+            armedAt = os.time()
             render()
         end,
     })
@@ -577,6 +820,45 @@ local function runViewRows()
     table.insert(rows, ui.row({ key = "run-head", gap = 6, align = "center" }, header))
     for index, item in ipairs(run.packages or {}) do
         table.insert(rows, rollbackRow(run, index, item, probePkgs))
+    end
+    return rows
+end
+
+-- The changelog view: a back button, then one release per entry in
+-- CHANGELOG.md with its bullet points underneath.
+local function changelogRows()
+    local rows = {}
+    table.insert(rows, ui.row({ key = "changelog-head", gap = 6, align = "center" }, {
+        ui.button({
+            glyph = "chevron-left", variant = "ghost", controlSize = "sm", width = 22, height = 22, glyphSize = 12,
+            tooltip = tr("action_back"),
+            onClick = function()
+                changelogOpen = false
+                render()
+            end,
+        }),
+        ui.label({ text = tr("changelog_title"), fontSize = 12, fontWeight = "bold", color = "on_surface", flexGrow = 1, maxLines = 1 }),
+    }))
+    if #changelog == 0 then
+        table.insert(rows, ui.row({ key = "changelog-empty", paddingH = 18 }, {
+            ui.label({ text = tr("changelog_empty"), fontSize = 11, color = "on_surface_variant" }),
+        }))
+        return rows
+    end
+    for ri, release in ipairs(changelog) do
+        local heading = "v" .. release.version
+        if release.date ~= nil and release.date ~= "" then
+            heading = heading .. "  ·  " .. release.date
+        end
+        table.insert(rows, ui.row({ key = "changelog-v" .. ri, gap = 6, align = "center" }, {
+            ui.label({ text = heading, fontSize = 12, fontWeight = "bold", color = "on_surface" }),
+        }))
+        for li, bullet in ipairs(release.lines) do
+            table.insert(rows, ui.row({ key = "changelog-" .. ri .. "-" .. li, paddingH = 10, gap = 6 }, {
+                ui.label({ text = "•", fontSize = 11, color = "on_surface_variant" }),
+                ui.label({ text = bullet, fontSize = 11, color = "on_surface_variant", flexGrow = 1, maxLines = 3 }),
+            }))
+        end
     end
     return rows
 end
@@ -665,8 +947,15 @@ local function extras()
         }))
     end
 
-    -- Offered until the polkit keep-authorization rule is installed.
-    if snapshot.polkitRule == false and phaseOf() ~= "running" and noctalia.getConfig("hide_polkit_hint") ~= true then
+    -- Offered until the polkit keep-authorization rule is installed. Only in
+    -- background mode: a terminal run goes through sudo, so the repeated
+    -- polkit prompts the rule solves never happen there.
+    if
+        snapshot.polkitRule == false
+        and noctalia.getConfig("update_mode") == "background"
+        and phaseOf() ~= "running"
+        and noctalia.getConfig("hide_polkit_hint") ~= true
+    then
         table.insert(lines, ui.row({ key = "polkit", gap = 6, align = "center" }, {
             ui.glyph({ name = "shield", size = 13, color = "on_surface_variant" }),
             ui.label({
@@ -708,13 +997,102 @@ local function extras()
     return lines
 end
 
+-- ── Maintenance: cache, orphans, firmware ────────────────────────────────────
+
+local function formatGib(bytes)
+    return string.format("%.1f", (tonumber(bytes) or 0) / 1073741824)
+end
+
+local function maintenanceSection()
+    if snapshot == nil or type(snapshot.maintenance) ~= "table" or busy() or changelogOpen or openedRunAt ~= nil then
+        return nil
+    end
+    local m = snapshot.maintenance
+    local busyM = snapshot.maintenanceBusy == true
+    local rows = {}
+
+    -- Cache size plus what a prune would free (paccache dry run).
+    if tonumber(m.cacheBytes) ~= nil then
+        local text = tr("maint_cache", { size = formatGib(m.cacheBytes) })
+        if (tonumber(m.pruneCount) or 0) > 0 then
+            text = text .. " · " .. tr("maint_cache_prunable", { count = tostring(m.pruneCount), saved = tostring(m.pruneSaved or "") })
+        end
+        local row = {
+            ui.glyph({ name = "database", size = 13, color = "on_surface_variant" }),
+            ui.label({ text = text, fontSize = 12, color = "on_surface_variant", flexGrow = 1, maxLines = 2 }),
+        }
+        if (tonumber(m.pruneCount) or 0) > 0 then
+            table.insert(row, ui.button({
+                key = "maint-prune" .. (busyM and "-off" or ""),
+                glyph = "trash", variant = "ghost", controlSize = "sm", width = 22, height = 22, glyphSize = 12,
+                enabled = not busyM,
+                tooltip = tr("tip_prune"),
+                onClick = function()
+                    request("prune_cache")
+                end,
+            }))
+        end
+        table.insert(rows, ui.row({ key = "maint-cache", gap = 6, align = "center" }, row))
+    end
+
+    -- Orphans go through the same armed confirm as rollback: their removal
+    -- is a root pacman -Rns.
+    local orphans = type(m.orphans) == "table" and m.orphans or {}
+    if #orphans > 0 and not busyM then
+        local names = table.concat(orphans, ", ")
+        if #names > 200 then
+            names = names:sub(1, 200) .. "…"
+        end
+        table.insert(rows, ui.row({ key = "maint-orphans", gap = 6, align = "center" }, {
+            ui.glyph({ name = "package-off", size = 13, color = "on_surface_variant" }),
+            ui.label({
+                text = noctalia.trp("maint_orphans", #orphans, { count = #orphans }),
+                fontSize = 12, color = "on_surface_variant", flexGrow = 1,
+            }),
+            rollbackButton("maint-orphans-rm", tr("tip_orphans", { names = names }), function()
+                request("remove_orphans")
+            end, "trash"),
+        }))
+    end
+
+    -- Firmware (fwupd): shown only when the tool is on the system; the
+    -- update itself is interactive, so it opens a terminal.
+    if m.fwupd == true then
+        table.insert(rows, ui.row({ key = "maint-fwupd", gap = 6, align = "center" }, {
+            ui.glyph({ name = "cpu", size = 13, color = "on_surface_variant" }),
+            ui.label({ text = tr("maint_fwupd"), fontSize = 12, color = "on_surface_variant", flexGrow = 1 }),
+            ui.button({
+                glyph = "external-link", variant = "ghost", controlSize = "sm", width = 22, height = 22, glyphSize = 12,
+                tooltip = tr("tip_fwupd"),
+                onClick = function()
+                    request("fwupd_update")
+                end,
+            }),
+        }))
+    end
+
+    if busyM then
+        table.insert(rows, ui.label({ key = "maint-busy", text = tr("maint_busy"), fontSize = 11, color = "secondary" }))
+    end
+
+    if #rows == 0 then
+        return nil
+    end
+    return ui.column({ key = "maintenance", gap = 4 }, rows)
+end
+
 local function body()
     local children = {}
 
     -- The middle of the panel: the live log while updating (and after a
-    -- failure), an opened history run, or the package list.
+    -- failure), the changelog, an opened history run, or the package list.
+    -- The live log always wins over the changelog: a run in progress is more
+    -- urgent than release notes.
     if phaseOf() == "running" or (runFailed() and #logLines() > 0) then
         table.insert(children, logSection())
+    elseif changelogOpen then
+        table.insert(children, ui.scroll({ key = "changelog-view", flexGrow = 1, gap = 4 }, changelogRows()))
+        return children
     else
         local runRows = openedRunAt ~= nil and runViewRows() or nil
         if runRows ~= nil then
@@ -744,6 +1122,11 @@ local function body()
 
     for _, line in ipairs(extras()) do
         table.insert(children, line)
+    end
+
+    local maint = maintenanceSection()
+    if maint ~= nil then
+        table.insert(children, maint)
     end
 
     if not busy() then
@@ -794,6 +1177,17 @@ render = function()
                 end,
             }),
             ui.button({
+                key = "header-changelog" .. (changelogOpen and "-on" or ""),
+                glyph = "history",
+                variant = changelogOpen and "primary" or "ghost",
+                tooltip = tr("tip_changelog"),
+                onClick = function()
+                    changelogOpen = not changelogOpen
+                    armedKey = nil
+                    render()
+                end,
+            }),
+            ui.button({
                 glyph = "close", variant = "ghost", tooltip = tr("tip_close"),
                 onClick = function()
                     panel.close()
@@ -803,14 +1197,56 @@ render = function()
         ui.label({ text = text, color = color, maxLines = 2 }),
     }
 
+    -- A source whose check failed is announced right under the headline —
+    -- at the bottom it read as fine print, and "up to date" without it
+    -- would be a lie.
+    if not busy() then
+        for _, name in ipairs(failedSources()) do
+            table.insert(children, ui.label({
+                text = tr("check_failed_source", { source = name }),
+                fontSize = 11,
+                color = "error",
+                maxLines = 2,
+            }))
+        end
+        -- Known failure signatures found in the last run's log: a broken
+        -- initramfs must be seen before the next reboot, not after.
+        if snapshot ~= nil and type(snapshot.logWarnings) == "table" then
+            for _, tag in ipairs(snapshot.logWarnings) do
+                local key = tag == "INITRAMFS" and "warn_initramfs"
+                    or tag == "COMMIT" and "warn_commit"
+                    or tag == "SIGNATURE" and "warn_signature"
+                    or nil
+                if key ~= nil then
+                    table.insert(children, ui.label({
+                        text = tr(key),
+                        fontSize = 11,
+                        color = tag == "SIGNATURE" and "warning" or "error",
+                        maxLines = 2,
+                    }))
+                end
+            end
+        end
+    end
+
     for _, node in ipairs(body()) do
         table.insert(children, node)
     end
 
+    -- Both footers hide while a check or run is on screen, so neither ever
+    -- competes with the live log for space. The activity graph also hides
+    -- while the changelog is open: it plots pending-update counts, which
+    -- has nothing to do with release notes.
+    local activity = not busy() and not changelogOpen and activitySection() or nil
     local history = not busy() and historySection() or nil
-    if history ~= nil then
+    if activity ~= nil or history ~= nil then
         table.insert(children, ui.separator({}))
-        table.insert(children, history)
+        if activity ~= nil then
+            table.insert(children, activity)
+        end
+        if history ~= nil then
+            table.insert(children, history)
+        end
     else
         local caption = footerCaption()
         if caption ~= nil then
@@ -821,7 +1257,9 @@ render = function()
 
     if phase ~= "missing" then
         local footer = {}
-        if runFailed() then
+        -- Not offered after a failed rollback: re-running the *update*
+        -- command in a terminal is not a retry of the rollback.
+        if runFailed() and (snapshot == nil or snapshot.runKind ~= "rollback") then
             table.insert(footer, ui.button({
                 key = "retry-terminal",
                 glyph = "terminal", text = tr("action_run_terminal"), variant = "ghost", flexGrow = 1,
@@ -839,14 +1277,21 @@ render = function()
                 panel.close()
             end,
         }))
+        local backgroundMode = noctalia.getConfig("update_mode") == "background"
         table.insert(footer, ui.button({
             key = "update" .. (hasUpdates and "" or "-off"),
-            glyph = "download", text = tr("action_update"), variant = "primary", enabled = hasUpdates,
-            tooltip = tr("tip_update"),
+            glyph = backgroundMode and "download" or "terminal",
+            text = tr("action_update"), variant = "primary", enabled = hasUpdates,
+            tooltip = backgroundMode and tr("tip_update") or tr("tip_update_terminal"),
             onClick = function()
-                -- The panel stays open: the log section takes over so the
-                -- run can be watched live.
                 request("update")
+                if not backgroundMode then
+                    -- Terminal mode hands the run off to its own window, so
+                    -- the panel has nothing left to show; background mode
+                    -- keeps it open since the live log is the only place
+                    -- progress is visible.
+                    panel.close()
+                end
             end,
         }))
         table.insert(children, ui.row({ gap = 8, align = "center", justify = "end" }, footer))
@@ -862,7 +1307,24 @@ function onOpen(_context)
     hoverText = ""
     openedRunAt = nil
     armedKey = nil
+    activityHoverIndex = nil
+    -- A fresh auto-open from a just-finished update (see the state watcher
+    -- below) survives this reset once, so it's not discarded before it's
+    -- ever seen; any other reason for opening still defaults to the sources.
+    if not changelogAutoOpenPending then
+        changelogOpen = false
+    end
+    changelogAutoOpenPending = false
     render()
+end
+
+-- An armed confirm is a one-click trigger for a privileged downgrade: if the
+-- confirming click doesn't come soon, put the plain button back.
+function update()
+    if armedKey ~= nil and os.time() - armedAt >= ARM_TIMEOUT_S then
+        armedKey = nil
+        render()
+    end
 end
 
 noctalia.state.watch(STATE_KEY, function(value)
@@ -877,6 +1339,23 @@ noctalia.state.watch(STATE_KEY, function(value)
     if value.phase == "running" and (snapshot == nil or snapshot.phase ~= "running") then
         openedRunAt = nil
         armedKey = nil
+        changelogOpen = false
+    end
+    -- lastUpdateAt only moves for a real, successful update run (never a
+    -- rollback or a plain check, see recordUpdateRun in service.luau), and it
+    -- is bumped the moment the run succeeds, before the auto re-check even
+    -- starts - so a change here is an exact, one-shot "an update just
+    -- finished" signal.
+    local prevUpdateAt = snapshot ~= nil and tonumber(snapshot.lastUpdateAt) or nil
+    local newUpdateAt = tonumber(value.lastUpdateAt)
+    if
+        prevUpdateAt ~= nil
+        and newUpdateAt ~= nil
+        and newUpdateAt ~= prevUpdateAt
+        and noctalia.getConfig("show_changelog_after_update") ~= false
+    then
+        changelogOpen = true
+        changelogAutoOpenPending = true
     end
     snapshot = value
     render()

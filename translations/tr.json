@@ -8,10 +8,9 @@
     "one": "1 paket yoksayıldı",
     "other": "{count} paket yoksayıldı"
   },
-  "err_aur_failed": "AUR kontrolü başarısız, detaylar için sistem loglarına bak",
+  "check_failed_source": "{source} kontrolü başarısız, detaylar için sistem loglarına bak",
   "err_check_failed": "checkupdates başarısız, detaylar için sistem log'larını kontrol et",
   "err_check_timeout": "Güncellemeler kontrol edilirken zaman aşımına uğrandı",
-  "err_flatpak_failed": "Flatpak kontrolü başarısız, detaylar için sistem log'larını kontrol et",
   "err_no_checkupdates": "checkupdates bulunamadı, pacman-contrib'i yükle ve PATH'i kontrol et",
   "err_no_terminal": "Terminal emülatörü bulunamadı, eklenti ayarlarından ekle",
   "err_no_xdg_open": "xdg-open bulunamadı, paket sayfası açılamıyor",
